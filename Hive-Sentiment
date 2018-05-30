@@ -1,0 +1,172 @@
+add jar /usr/local/apache-hive-1.2.2-bin/lib/json-serde-1.3.8-jar-with-dependencies.jar;
+# link to download the above serde https://drive.google.com/open?id=1qqrzYDI51PjT8dB2OFUKPrXpNOF2TJjO 
+# move this serde here /usr/local/apache-hive-1.2.2-bin/lib
+#after that create a folder on hadoop with the same name /usr/local/apache-hive-1.2.2-bin/lib and put every jar file of hive inside this
+--add jar /usr/local/apache-hive-1.2.2-bin/lib/hive-serdes-1.0-SNAPSHOT.jar
+drop table if exists Mytweets_raw;
+CREATE EXTERNAL TABLE Mytweets_raw (
+   created_at STRING,
+   source STRING,
+   retweeted_status STRUCT<
+      text:STRING,
+      `user`:STRUCT<screen_name:STRING,name:STRING>>,
+   entities STRUCT<
+      urls:ARRAY<STRUCT<expanded_url:STRING>>,
+      user_mentions:ARRAY<STRUCT<screen_name:STRING,name:STRING>>,
+      hashtags:ARRAY<STRUCT<text:STRING>>>,
+`user` STRUCT<
+      utc_offset:INT,
+      friends_count:INT,
+      followers_count:INT,
+      screen_name:STRING,
+      verified:BOOLEAN,
+      time_zone:STRING,
+      statuses_count:INT,
+      name:STRING>,
+
+   retweet_count INT,
+   in_reply_to_screen_name STRING,
+   id_str BIGINT,   
+   id BIGINT,
+   text STRING,
+   favorited BOOLEAN,
+   truncated BOOLEAN
+   
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+WITH SERDEPROPERTIES ("input.regex"="([^ ]*) ([^ ]{8})[^ ]* ([A-Z]*) ([^ ]*): (.*)",
+"output.format.string"="%1$s %2$s %3$s %4$s %5$s")
+location '/getme';
+
+-- load data local inpath '/root/Desktop/twitter_data.txt' overwrite INTO TABLE Mytweets_raw
+select id from mytweets_raw limit 10;
+
+-- create sentiment dictionary
+drop table if exists dictionary;
+CREATE EXTERNAL TABLE dictionary (
+    type string,
+    length int,
+    word string,
+    pos string,
+    stemmed string,
+    polarity string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' 
+STORED AS TEXTFILE
+LOCATION '/data/dictionary/';
+--load data inpath '/data/dictionary/dictionary_copy_1.tsv' INTO TABLE dictionary
+
+
+drop table if exists time_zone_map;
+CREATE EXTERNAL TABLE time_zone_map (
+    time_zone string,
+    country string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' 
+STORED AS TEXTFILE
+LOCATION '/data/time_zone_map';
+
+-- loading data to the table time_zone_map
+-- load data inpath '/data/time_zone_map/time_zone_map.tsv' INTO TABLE time_zone_map
+drop table if exists stopwords;
+CREATE EXTERNAL TABLE stopwords (
+word string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\n'
+STORED AS TEXTFILE
+location '/data/stopwords/';
+--load data inpath '/data/stopwords/a.txt' INTO TABLE stopwords
+
+drop view if exists tweets_simple;
+CREATE VIEW tweets_simple AS
+SELECT
+  id,
+  `user`.screen_name,
+  source,
+  retweet_count,
+  entities.hashtags,
+  cast ( from_unixtime( unix_timestamp(concat( '2016 ', substring(created_at,5,15)), 'yyyy MMM dd hh:mm:ss')) as timestamp) ts,
+  text,
+  `user`.statuses_count,
+  `user`.friends_count,
+  `user`.followers_count,
+  `user`.time_zone  
+FROM Mytweets_raw;
+
+drop view if exists tweets_rem_spam;
+CREATE VIEW tweets_rem_spam AS
+SELECT * 
+FROM tweets_simple 
+WHERE 
+ statuses_count > 50 AND
+ friends_count/followers_count > 0.01 AND
+ length(text) > 10 AND
+size(hashtags) < 10;
+
+drop view if exists tweets_clean;
+CREATE VIEW tweets_clean AS
+SELECT
+  id,
+  t.screen_name,
+  source,
+  retweet_count,
+  t.hashtags,
+  ts,
+  text,
+  m.country 
+FROM tweets_simple t LEFT OUTER JOIN time_zone_map m ON t.time_zone = m.time_zone;
+
+drop view if exists l1;
+create view l1 as select id, words from Mytweets_raw lateral view explode(sentences(lower(text))) dummy as words;
+drop view if exists l2;
+create view l2 as select id, word from l1 lateral view explode( words ) dummy as word;
+
+--create view l_clean as select * from l2 where l2.word not in (select * from stopwords) and regexp_replace(l2.word,'[^a-zA-Z0-9]+','') != ''
+create view l_clean as select * from l2 where regexp_replace(l2.word,'[^a-zA-Z0-9]+','');
+drop view if exists l3;
+create view l3 as select 
+    id, 
+    l2.word, 
+    case d.polarity 
+      when  'negative' then -1
+      when 'positive' then 1 
+      else 0 end as polarity 
+ from l2 left outer join dictionary d on l2.word = d.word;
+#####################                            ###############################
+drop table if exists tweets_sentiment;
+create table tweets_sentiment as select 
+  id, 
+  case 
+    when sum( polarity ) > 0 then 'positive' 
+    when sum( polarity ) < 0 then 'negative'  
+    else 'neutral' end as sentiment 
+ from l3 group by id;
+ 
+ 
+ -- put everything back together and re-name sentiments...
+drop table if exists tweetsbi;
+CREATE TABLE tweetsbi 
+AS
+SELECT 
+  t.*,
+  s.sentiment 
+FROM tweets_clean t LEFT OUTER JOIN tweets_sentiment s on t.id = s.id;
+
+-- data with tweet counts.....
+drop table if exists tweetsbiaggr;
+CREATE TABLE tweetsbiaggr 
+AS
+SELECT 
+  country,sentiment, count(sentiment) as tweet_count 
+FROM tweetsbi
+group by country,sentiment;
+
+-- store data for analysis......
+drop view if exists A;
+drop view if exists B;
+drop view if exists C;
+drop table if exists tweetcompare;
+CREATE VIEW A as select country,tweet_count as positive_response from tweetsbiaggr where sentiment='positive';
+CREATE VIEW B as select country,tweet_count as negative_response from tweetsbiaggr where sentiment='negative';
+CREATE VIEW C as select country,tweet_count as neutral_response from tweetsbiaggr where sentiment='neutral';
+CREATE TABLE tweetcompare as select A.*,B.negative_response as negative_response,C.neutral_response as neutral_response from A join B on A.country= B.country join C on B.country=C.country;
